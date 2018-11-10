@@ -29,7 +29,7 @@ timer_initialize(void) {
 	_time_freq = 1000000000LL;
 #else
 	struct timespec ts = { .tv_sec = 0, .tv_nsec = 0 };
-	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+	if (clock_gettime(CLOCK_REALTIME, &ts))
 		return -1;
 	_time_freq = 1000000000LL;
 #endif
@@ -48,7 +48,7 @@ timer_current(void) {
 	return curclock;
 #else
 	struct timespec ts = { .tv_sec = 0, .tv_nsec = 0 };
-	clock_gettime(CLOCK_MONOTONIC, &ts);
+	clock_gettime(CLOCK_REALTIME, &ts);
 	return ((uint64_t)ts.tv_sec * 1000000000LL) + (uint64_t)ts.tv_nsec;
 #endif
 }
