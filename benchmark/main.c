@@ -585,7 +585,7 @@ benchmark_run(int argc, char** argv) {
                 printf("Usage: benchmark <thread count> <mode> <size mode> <cross rate> <loops> <allocs> <op count> <min size> <max size>\n"
                        "         <thread count>     Number of execution threads\n"
                        "         <mode>             0 for random size [min, max], 1 for fixed size (min)\n"
-                       "         <size mode>        0 for even distribution, 1 for linear dropoff, 2 for exp dropoff\n"
+                       "         <size mode>        0 for even distribution, 1 for linear dropoff, 2 for Pareto dropoff\n"
                        "         <cross rate>       Rate of cross-thread deallocations (every n iterations), 0 for none\n"
                        "         <loops>            Number of loops in each iteration (0 for default, 800k)\n"
                        "         <allocs>           Number of concurrent allocations for all threads, (0 for default, 10k)\n"
@@ -703,7 +703,7 @@ benchmark_run(int argc, char** argv) {
                 printf("%s %u threads random %s size [%u,%u] %u loops %u allocs %u ops: ",
                         benchmark_name(),
                         (unsigned int)thread_count,
-                        (size_mode == SIZE_MODE_EVEN) ? "even" : ((size_mode == SIZE_MODE_LINEAR) ? "linear" : "exp"),
+                        (size_mode == SIZE_MODE_EVEN) ? "even" : ((size_mode == SIZE_MODE_LINEAR) ? "linear" : "pareto"),
                         (unsigned int)min_size, (unsigned int)max_size,
                         (unsigned int)loop_count, (unsigned int)alloc_count, (unsigned int)op_count);
         else
@@ -835,7 +835,7 @@ benchmark_run(int argc, char** argv) {
                            "%u,%" PRIsize ",%" PRIsize ",%" PRIsize "\n",
                            benchmark_name(),
                            (mode == MODE_RANDOM ? "random" : "fixed"),
-                           (size_mode == SIZE_MODE_EVEN ? "even" : ((size_mode == SIZE_MODE_LINEAR) ? "linear" : "exp")),
+                           (size_mode == SIZE_MODE_EVEN ? "even" : ((size_mode == SIZE_MODE_LINEAR) ? "linear" : "pareto")),
                            (unsigned int)thread_count,
                            (unsigned int)min_size,
                            (mode == MODE_RANDOM ? (unsigned int)max_size : (unsigned int)min_size),
