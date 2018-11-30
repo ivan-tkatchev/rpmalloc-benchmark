@@ -368,6 +368,9 @@ benchmark_worker(void* argptr) {
 
                         foreign = get_cross_thread_memory(&arg->foreign);
 
+                        allocated = 0;
+                        tick_start = timer_current();
+
                         if (foreign) {
                                 for (iop = 0; iop < foreign->count; ++iop) {
                                         benchmark_free(foreign->pointers[iop]);
@@ -378,9 +381,6 @@ benchmark_worker(void* argptr) {
                                 benchmark_free(foreign);
                                 arg->mops += 2;
                         }
-
-                        allocated = 0;
-                        tick_start = timer_current();
 
                         const size_t free_op_count = num_free_ops[(iter + iloop) % free_ops_count];
                         const size_t alloc_op_count = num_alloc_ops[(iter + iloop) % alloc_ops_count];
@@ -491,7 +491,7 @@ benchmark_worker(void* argptr) {
                 fflush(stdout);
         }
 
-        //Sync threads
+        //
         thread_sleep(1000);
         thread_fence();
 
