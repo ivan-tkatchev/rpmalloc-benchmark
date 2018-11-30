@@ -39,12 +39,10 @@ struct benchmark_arg {
         size_t alloc_count;
         size_t min_size;
         size_t max_size;
-        size_t accumulator;
         uint64_t ticks;
         uint64_t mops;
         atomicptr_t foreign;
         atomic32_t allocated;
-        int32_t peak_allocated;
         thread_arg thread_arg;
         benchmark_arg* args;
 };
@@ -57,7 +55,6 @@ struct thread_pointers {
 };
 
 static int benchmark_start;
-static atomic32_t benchmark_threads_sync;
 static atomic32_t cross_thread_counter;
 static size_t alloc_scatter;
 static size_t free_scatter;
@@ -317,11 +314,18 @@ put_cross_thread_memory(atomicptr_t* ptr, thread_pointers* pointers) {
 static thread_pointers*
 get_cross_thread_memory(atomicptr_t* ptr) {
         void* prev;
+        void* next;
         thread_pointers* current;
         do {
                 prev = atomic_load_ptr(ptr);
                 current = (void*)((uintptr_t)prev & ~(uintptr_t)0xF);
-        } while (current && !atomic_cas_ptr(ptr, (void*)((uintptr_t)atomic_incr32(&cross_thread_counter) & 0xF), prev));
+
+                if (current) {
+                    next = (uintptr_t)current->next | (atomic_incr32(&cross_thread_counter) & 0xF);
+                }
+
+        } while (current && !atomic_cas_ptr(ptr, next, prev));
+
         return current;
 }
 
@@ -344,7 +348,6 @@ benchmark_worker(void* argptr) {
         uint64_t tick_start, ticks_elapsed;
         int32_t allocated;
         size_t cross_index = 0;
-        int aborted = 0;
 
         benchmark_thread_initialize();
 
@@ -361,12 +364,20 @@ benchmark_worker(void* argptr) {
         for (size_t iter = 0; iter < 2; ++iter) {
                 size_t size_index = ((arg->index + 1) * ((iter + 1) * 37)) % random_size_count;
 
-                uint64_t iter_ticks_elapsed = 0;
-                int do_foreign = 1;
-
                 for (size_t iloop = 0; iloop < arg->loop_count; ++iloop) {
 
                         foreign = get_cross_thread_memory(&arg->foreign);
+
+                        if (foreign) {
+                                for (iop = 0; iop < foreign->count; ++iop) {
+                                        benchmark_free(foreign->pointers[iop]);
+                                        ++arg->mops;
+                                }
+
+                                benchmark_free(foreign->pointers);
+                                benchmark_free(foreign);
+                                arg->mops += 2;
+                        }
 
                         allocated = 0;
                         tick_start = timer_current();
@@ -376,7 +387,6 @@ benchmark_worker(void* argptr) {
 
                         for (iop = 0; iop < free_op_count; ++iop) {
                                 if (pointers[free_idx]) {
-                                        allocated -= *(int32_t*)pointers[free_idx];
                                         benchmark_free(pointers[free_idx]);
                                         ++arg->mops;
                                         pointers[free_idx] = 0;
@@ -385,26 +395,8 @@ benchmark_worker(void* argptr) {
                                 free_idx = (free_idx + free_scatter) % arg->alloc_count;
                         }
 
-                        while (foreign) {
-                                int32_t foreign_allocated = 0;
-                                for (iop = 0; iop < foreign->count; ++iop) {
-                                        foreign_allocated -= *(int32_t*)foreign->pointers[iop];
-                                        benchmark_free(foreign->pointers[iop]);
-                                        ++arg->mops;
-                                }
-
-                                void* next = foreign->next;
-                                foreign_allocated -= (int32_t)(foreign->count * sizeof(void*) + sizeof(thread_pointers));
-                                atomic_add32(foreign->allocated, foreign_allocated);
-                                benchmark_free(foreign->pointers);
-                                benchmark_free(foreign);
-                                arg->mops += 2;
-                                foreign = next;
-                        }
-
                         for (iop = 0; iop < alloc_op_count; ++iop) {
                                 if (pointers[alloc_idx]) {
-                                        allocated -= *(int32_t*)pointers[alloc_idx];
                                         benchmark_free(pointers[alloc_idx]);
                                         ++arg->mops;
                                 }
@@ -424,15 +416,19 @@ benchmark_worker(void* argptr) {
                                 size_index = (size_index + 1) % random_size_count;
                         }
 
+                        ticks_elapsed = timer_current() - tick_start;
+                        arg->ticks += ticks_elapsed;
+
                         foreign = 0;
-                        if (arg->cross_rate && ((iloop % arg->cross_rate) == 0) && (do_foreign > 0)) {
+                        if (arg->cross_rate && (iloop % arg->cross_rate) == 0) {
                                 foreign = benchmark_malloc(16, sizeof(thread_pointers));
                                 foreign->count = alloc_op_count;
                                 foreign->pointers = benchmark_malloc(16, sizeof(void*) * alloc_op_count);
-                                foreign->allocated = atomic_load32(&arg->allocated);
+                                foreign->allocated = &arg->allocated;
                                 allocated += (int32_t)(alloc_op_count * sizeof(void*) + sizeof(thread_pointers));
                                 arg->mops += 2;
 
+                                tick_start = timer_current();
                                 for (iop = 0; iop < alloc_op_count; ++iop) {
                                         size_t size = arg->min_size;
                                         if (arg->mode == MODE_RANDOM)
@@ -442,134 +438,82 @@ benchmark_worker(void* argptr) {
                                         size_t num_pages = (size - 1) / 4096;
                                         for (size_t page = 1; page < num_pages; ++page)
                                                 *((char*)(foreign->pointers[iop]) + (page * 4096)) = 1;
-                                        *((char*)(foreign->pointers[iop]) + (size - 1)) = 1;
                                         allocated += (int32_t)size;
                                         ++arg->mops;
 
                                         size_index = (size_index + 1) % random_size_count;
                                 }
-                        }
+                                ticks_elapsed = timer_current() - tick_start;
+                                arg->ticks += ticks_elapsed;
 
-                        ticks_elapsed = timer_current() - tick_start;
-                        iter_ticks_elapsed += ticks_elapsed;
-                        arg->ticks += ticks_elapsed;
-
-                        int32_t current_allocated = atomic_add32(&arg->allocated, allocated);
-                        if (arg->peak_allocated < current_allocated)
-                                arg->peak_allocated = current_allocated;
-
-                        if (foreign) {
                                 cross_index = (cross_index + 1) % arg->numthreads;
                                 if ((arg->numthreads > 1) && (cross_index == arg->index))
                                         cross_index = (cross_index + 1) % arg->numthreads;
+
                                 benchmark_arg* cross_arg = &arg->args[cross_index];
                                 put_cross_thread_memory(&cross_arg->foreign, foreign);
                                 foreign = 0;
                         }
 
-                        if (atomic_load32(&benchmark_threads_sync) > 0)
-                                do_foreign = 0; //one thread completed
-
-                        if (timer_ticks_to_seconds(iter_ticks_elapsed) > 120) {
-                                aborted = 1;
-                                break;
-                        }
+                        atomic_add32(&arg->allocated, allocated);
                 }
 
-                //Sync and allow main thread to gather allocation stats
-                atomic_incr32(&benchmark_threads_sync);
-                do {
-                        foreign = get_cross_thread_memory(&arg->foreign);
-                        if (foreign) {
-                                tick_start = timer_current();
-                                while (foreign) {
-                                        allocated = 0;
-                                        for (iop = 0; iop < foreign->count; ++iop) {
-                                                allocated -= *(int32_t*)foreign->pointers[iop];
-                                                benchmark_free(foreign->pointers[iop]);
-                                                ++arg->mops;
-                                        }
+                //
+                while (foreign = get_cross_thread_memory(&arg->foreign)) {
+                        tick_start = timer_current();
 
-                                        void* next = foreign->next;
-                                        allocated -= (int32_t)(foreign->count * sizeof(void*) + sizeof(thread_pointers));
-                                        atomic_add32(foreign->allocated, allocated);
-                                        benchmark_free(foreign->pointers);
-                                        benchmark_free(foreign);
-                                        arg->mops += 2;
-                                        foreign = next;
-                                }
-                                ticks_elapsed = timer_current() - tick_start;
-                                arg->ticks += ticks_elapsed;
+                        for (iop = 0; iop < foreign->count; ++iop) {
+                                benchmark_free(foreign->pointers[iop]);
+                                ++arg->mops;
                         }
 
-                        thread_sleep(1);
-                        thread_fence();
-                } while (atomic_load32(&benchmark_threads_sync));
+                        benchmark_free(foreign->pointers);
+                        benchmark_free(foreign);
+                        arg->mops += 2;
 
-                allocated = 0;
+                        ticks_elapsed = timer_current() - tick_start;
+                        arg->ticks += ticks_elapsed;
+                }
+
                 tick_start = timer_current();
                 for (size_t iptr = 0; iptr < arg->alloc_count; ++iptr) {
                         if (pointers[iptr]) {
-                                allocated -= *(int32_t*)pointers[iptr];
                                 benchmark_free(pointers[iptr]);
                                 ++arg->mops;
                                 pointers[iptr] = 0;
                         }
                 }
                 ticks_elapsed = timer_current() - tick_start;
-                atomic_add32(&arg->allocated, allocated);
 
-                iter_ticks_elapsed += ticks_elapsed;
                 arg->ticks += ticks_elapsed;
 
                 printf(".");
                 fflush(stdout);
-
-                //printf(" %.2f ", timer_ticks_to_seconds(iter_ticks_elapsed));
-                //if (aborted)
-                //        printf("(aborted) ");
-                //fflush(stdout);
-                aborted = 0;
         }
 
         //Sync threads
         thread_sleep(1000);
         thread_fence();
-        atomic_incr32(&benchmark_threads_sync);
-        do {
-                foreign = get_cross_thread_memory(&arg->foreign);
-                if (foreign) {
-                        tick_start = timer_current();
-                        while (foreign) {
-                                allocated = 0;
-                                for (iop = 0; iop < foreign->count; ++iop) {
-                                        allocated -= *(int32_t*)foreign->pointers[iop];
-                                        benchmark_free(foreign->pointers[iop]);
-                                        ++arg->mops;
-                                }
 
-                                void* next = foreign->next;
-                                allocated -= (int32_t)(foreign->count * sizeof(void*) + sizeof(thread_pointers));
-                                atomic_add32(foreign->allocated, allocated);
-                                benchmark_free(foreign->pointers);
-                                benchmark_free(foreign);
-                                arg->mops += 2;
-                                foreign = next;
-                        }
-                        ticks_elapsed = timer_current() - tick_start;
-                        arg->ticks += ticks_elapsed;
+        while (foreign = get_cross_thread_memory(&arg->foreign)) {
+                tick_start = timer_current();
+
+                for (iop = 0; iop < foreign->count; ++iop) {
+                        benchmark_free(foreign->pointers[iop]);
+                        ++arg->mops;
                 }
 
-                thread_sleep(1);
-                thread_fence();
-        } while (atomic_load32(&benchmark_threads_sync));
+                benchmark_free(foreign->pointers);
+                benchmark_free(foreign);
+                arg->mops += 2;
+
+                ticks_elapsed = timer_current() - tick_start;
+                arg->ticks += ticks_elapsed;
+        } 
 
         benchmark_free(pointers);
-        atomic_add32(&arg->allocated, -(int32_t)pointers_size);
 
         benchmark_thread_finalize();
-
-        arg->accumulator += arg->mops;
 
         thread_exit(0);
 }
@@ -715,15 +659,12 @@ benchmark_run(int argc, char** argv) {
         fflush(stdout);
 
         size_t memory_usage = 0;
-        size_t cur_memory_usage = 0;
         size_t sample_allocated = 0;
-        size_t cur_allocated = 0;
         uint64_t mops = 0;
         uint64_t ticks = 0;
 
         for (size_t iter = 0; iter < 2; ++iter) {
                 benchmark_start = 0;
-                atomic_store32(&benchmark_threads_sync, 0);
                 thread_fence();
 
                 for (size_t ithread = 0; ithread < thread_count; ++ithread) {
@@ -740,7 +681,6 @@ benchmark_run(int argc, char** argv) {
                         arg[ithread].thread_arg.arg = &arg[ithread];
                         atomic_store_ptr(&arg[ithread].foreign, 0);
                         atomic_store32(&arg[ithread].allocated, 0);
-                        arg[ithread].peak_allocated = 0;
                         arg[ithread].args = arg;
                         thread_fence();
                         thread_handle[ithread] = thread_run(&arg[ithread].thread_arg);
@@ -751,66 +691,54 @@ benchmark_run(int argc, char** argv) {
                 benchmark_start = 1;
                 thread_fence();
 
-                while (atomic_load32(&benchmark_threads_sync) < (int32_t)thread_count) {
-                        thread_sleep(1000);
-                        thread_fence();
-                }
                 thread_sleep(1000);
                 thread_fence();
 
-                cur_allocated = 0;
-                for (size_t ithread = 0; ithread < thread_count; ++ithread) {
-                        size_t thread_allocated = (size_t)atomic_load32(&arg[ithread].allocated);
-                        cur_allocated += thread_allocated;
-                }
-                cur_memory_usage = get_process_memory_usage();
-                if ((cur_allocated > sample_allocated) || (cur_memory_usage > memory_usage)) {
-                        sample_allocated = cur_allocated;
-                        memory_usage = cur_memory_usage;
+                size_t x = get_process_peak_memory_usage();
+
+                if (x > memory_usage) {
+                        memory_usage = x;
                 }
 
-                atomic_store32(&benchmark_threads_sync, 0);
-                thread_fence();
-
-                thread_sleep(1000);
-                while (atomic_load32(&benchmark_threads_sync) < (int32_t)thread_count) {
-                        thread_sleep(1000);
-                        thread_fence();
-                }
-                thread_sleep(1000);
-                thread_fence();
-
-                cur_allocated = 0;
-                for (size_t ithread = 0; ithread < thread_count; ++ithread) {
-                        size_t thread_allocated = (size_t)atomic_load32(&arg[ithread].allocated);
-                        cur_allocated += thread_allocated;
-                }
-                cur_memory_usage = get_process_memory_usage();
-                if ((cur_allocated > sample_allocated) || (cur_memory_usage > memory_usage)) {
-                        sample_allocated = cur_allocated;
-                        memory_usage = cur_memory_usage;
+                x = get_process_memory_usage();
+                if (x > memory_usage) {
+                        memory_usage = x;
                 }
 
-                atomic_store32(&benchmark_threads_sync, 0);
-                thread_fence();
-
-                thread_sleep(1000);
-                while (atomic_load32(&benchmark_threads_sync) < (int32_t)thread_count) {
-                        thread_sleep(1000);
-                        thread_fence();
-                }
-                thread_sleep(1000);
-                thread_fence();
-
-                atomic_store32(&benchmark_threads_sync, 0);
                 thread_fence();
 
                 for (size_t ithread = 0; ithread < thread_count; ++ithread) {
                         thread_join(thread_handle[ithread]);
                         ticks += arg[ithread].ticks;
                         mops += arg[ithread].mops;
-                        if (!arg[ithread].accumulator)
-                                exit(-1);
+
+                        thread_pointers* foreign = 0;
+                        uint64_t tick_start, ticks_elapsed;
+                        while (foreign = get_cross_thread_memory(&(arg[ithread].foreign))) {
+                                tick_start = timer_current();
+
+                                for (size_t iop = 0; iop < foreign->count; ++iop) {
+                                    benchmark_free(foreign->pointers[iop]);
+                                    ++mops;
+                                }
+
+                                benchmark_free(foreign->pointers);
+                                benchmark_free(foreign);
+                                mops += 2;
+
+                                ticks_elapsed = timer_current() - tick_start;
+                                ticks += ticks_elapsed;
+                        }
+                }
+
+                size_t peak_malloced = 0;
+                for (size_t ithread = 0; ithread < thread_count; ++ithread) {
+                        size_t thread_allocated = atomic_load32(&arg[ithread].allocated);
+                        peak_malloced += thread_allocated;
+                }
+
+                if (peak_malloced > sample_allocated) {
+                        sample_allocated = peak_malloced;
                 }
         }
 
@@ -825,14 +753,13 @@ benchmark_run(int argc, char** argv) {
         sprintf(filebuf, "benchmark.txt");
         fd = fopen(filebuf, "ab");
 
-        size_t peak_allocated = get_process_peak_memory_usage();
         double time_elapsed = timer_ticks_to_seconds(ticks);
         double average_mops = (double)mops / time_elapsed;
         char linebuf[2048];
 
         int len = snprintf(linebuf, sizeof(linebuf),
                            "%s,%s,%s,%u,%u,%u,"
-                           "%u,%" PRIsize ",%" PRIsize ",%" PRIsize "\n",
+                           "%u,%" PRIsize ",%" PRIsize ",%.2f\n",
                            benchmark_name(),
                            (mode == MODE_RANDOM ? "random" : "fixed"),
                            (size_mode == SIZE_MODE_EVEN ? "even" : ((size_mode == SIZE_MODE_LINEAR) ? "linear" : "pareto")),
@@ -840,18 +767,19 @@ benchmark_run(int argc, char** argv) {
                            (unsigned int)min_size,
                            (mode == MODE_RANDOM ? (unsigned int)max_size : (unsigned int)min_size),
                            (unsigned int)average_mops,
-                           peak_allocated / (1024 * 1024),
                            sample_allocated / (1024 * 1024),
-                           memory_usage / (1024 * 1024));
+                           memory_usage / (1024 * 1024),
+                           (double)sample_allocated / (double)memory_usage);
         if (fd) {
                 fwrite(linebuf, (len > 0) ? (size_t)len : 0, 1, fd);
                 fflush(fd);
         }
 
-        printf("\n%u memory ops/second (%uMiB peak, %uMiB -> %uMiB bytes sample, %.0f%% overhead)\n",
-                    (unsigned int)average_mops, (unsigned int)(peak_allocated / (1024 * 1024)),
-                (unsigned int)(sample_allocated / (1024 * 1024)), (unsigned int)(memory_usage / (1024 * 1024)),
-                100.0 * ((double)memory_usage - (double)sample_allocated) / (double)sample_allocated);
+        printf("\n%u memory ops/second (%uMiB allocated -> %uMiB bytes RSS, %.2f ratio; higher is better)\n",
+               (unsigned int)average_mops, 
+               (unsigned int)(sample_allocated / (1024 * 1024)),
+               (unsigned int)(memory_usage / (1024 * 1024)),
+               (double)sample_allocated / (double)memory_usage);
         fflush(stdout);
 
         if (fd)

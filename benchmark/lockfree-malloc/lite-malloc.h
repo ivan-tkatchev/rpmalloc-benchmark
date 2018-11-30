@@ -33,7 +33,7 @@
 // Use LITE_MALLOC_ENGINES_COUNT independent allocator engines.
 
 #ifndef LITE_MALLOC_ENGINES_COUNT
-#define LITE_MALLOC_ENGINES_COUNT 32
+#define LITE_MALLOC_ENGINES_COUNT 8
 #endif
 
 // Use per-thread engines instead of picking engines uniformly round-robin.

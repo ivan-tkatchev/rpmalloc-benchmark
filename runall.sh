@@ -12,7 +12,7 @@ for name in $names; do
 	executable=bin/$os/release/x86-64/benchmark-$name
 
         for th in $threads; do
-	    $executable $th 0 2 0 $loops 30000 3000 4 64000
+	    $executable $th 0 2 4 $loops 90000 3000 4 64000
         done
 done
 
